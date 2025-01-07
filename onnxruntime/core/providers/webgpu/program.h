@@ -32,6 +32,27 @@ constexpr size_t ProgramUniformVariableDataTypeSize[] = {sizeof(float), sizeof(u
 
 constexpr std::string_view ProgramUniformVariableDataTypeName[] = {"f32", "f16", "u32", "i32"};
 
+
+// Convert to a uniform variable data type from a tensor data type
+inline ProgramUniformVariableDataType UniformVariableDataTypeFromTensor(MLDataType data_type) {
+  auto primitive_data_type = data_type->AsPrimitiveDataType();
+  if (!primitive_data_type) {
+    ORT_THROW("Unsupported data type: ", data_type);
+  }
+  switch (primitive_data_type->GetDataType()) {
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
+      return ProgramUniformVariableDataType::Float32;
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
+      return ProgramUniformVariableDataType::Float16;
+    case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
+      return ProgramUniformVariableDataType::Uint32;
+    case ONNX_NAMESPACE::TensorProto_DataType_INT32:
+      return ProgramUniformVariableDataType::Int32;
+    default:
+      ORT_THROW("Unsupported data type: ", data_type);
+  }
+}
+
 // represents a runtime value of a uniform variable
 struct ProgramUniformVariableValue {
   ProgramUniformVariableValue();  // representing an empty uniform variable
@@ -308,6 +329,9 @@ class ProgramBase {
 
   inline const std::string& Name() const { return name_; }
   inline const ProgramMetadata& Metadata() const { return metadata_; }
+  inline gsl::span<const ProgramUniformVariableDefinition>& UniformVariables() {
+    return metadata_.uniform_variables;
+  }
   inline const std::string& CacheHint() const { return cache_hint_; }
   inline const std::vector<ProgramInput>& Inputs() const { return inputs_; }
   inline const std::vector<ProgramOutput>& Outputs() const { return outputs_; }

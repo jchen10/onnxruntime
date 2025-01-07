@@ -49,6 +49,14 @@ Status Gather::ComputeInternal(ComputeContext& context) const {
 
   uint32_t axis = static_cast<uint32_t>(p.axis);
   GatherProgram program{axis};
+
+  auto uniform_type = ProgramUniformVariableDataType::Uint32;
+  {
+    // We can get the uniform type from the tensor's data type.
+    // For Gather, this is unnecessary.
+    // uniform_type = UniformVariableDataTypeFromTensor(p.input_tensor->DataType());
+  }
+  program.SetUniformOverrideDataType(0, uniform_type);
   program
       .AddInputs({{p.input_tensor, ProgramTensorMetadataDependency::TypeAndRank},
                   {p.indices_tensor, ProgramTensorMetadataDependency::TypeAndRank}})
