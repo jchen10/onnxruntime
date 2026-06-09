@@ -46,6 +46,33 @@ class SubgroupMatrixMatMulNBitsProgram final : public Program<SubgroupMatrixMatM
   bool has_weight_idx_indirect_;
 };
 
+// Int8 DPAS path program: A and B are dynamically quantized to int8 and prepacked
+// into 32x32 tiles, then multiplied via hardware DPAS (i8 subgroup matrices).
+class SubgroupMatrixMatMulNBitsI8Program final : public Program<SubgroupMatrixMatMulNBitsI8Program> {
+ public:
+  SubgroupMatrixMatMulNBitsI8Program(bool has_bias, bool has_weight_idx, bool has_weight_idx_indirect, uint32_t block_size_k, bool full_k)
+      : Program{"SubgroupMatrixMatMulNBitsI8"},
+        has_bias_(has_bias),
+        has_weight_idx_(has_weight_idx),
+        has_weight_idx_indirect_(has_weight_idx_indirect),
+        block_size_k_(block_size_k),
+        full_k_(full_k) {};
+  Status GenerateShaderCode(ShaderHelper& sh) const override;
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"M", ProgramUniformVariableDataType::Uint32},
+      {"N", ProgramUniformVariableDataType::Uint32},
+      {"K", ProgramUniformVariableDataType::Uint32},
+      {"weight_idx", ProgramUniformVariableDataType::Uint32},
+      {"m_tiles_per_wg", ProgramUniformVariableDataType::Uint32});
+
+ private:
+  bool has_bias_;
+  bool has_weight_idx_;
+  bool has_weight_idx_indirect_;
+  uint32_t block_size_k_;
+  bool full_k_;
+};
+
 Status ApplySubgroupMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
                                       const Tensor* zero_points, const Tensor* bias,
                                       uint32_t M,

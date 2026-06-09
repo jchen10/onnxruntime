@@ -1,0 +1,144 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// Quantize fp16 A to i8 and prepack into 32x32 tiles for i8 DPAS path.
+// Single-pass implementation: uses subgroupMax to find per-row max|A| without
+// a separate scan pass, halving global memory reads vs the 2-pass approach.
+// Hardcoded for kBlockSizeK=128, SIMD=16 (all 16 lanes active, no idle threads).
+//
+// Input:  A [M, K] as f16 (component=4, accessed as vec4<f16>)
+// Output: A_i8 prepacked [num_tiles_m * num_tiles_k * 256] as u32 (32x32 tiles, each 256 u32)
+//         Within tile: M-major (M slow, K fast), stride = kTileK/4 = 8 u32 per M-row.
+//         This matches what subgroupMatrixLoad expects for row_major, stride=kTileK.
+//
+// Logical layout (input): A[M][K] row-major, one row per M
+//   Example: kBlockSizeK=128, kTileM=32, kTileK=32
+//
+//         K=0        K=31   K=32        K=63   K=64      K=95   K=96      K=127
+//   M=0  [a0_0  ... a0_31 | a0_32  ... a0_63 | a0_64 ...a0_95 | a0_96 ...a0_127]
+//   M=1  [a1_0  ... a1_31 | a1_32  ... a1_63 | a1_64 ...a1_95 | a1_96 ...a1_127]
+//   ...       tile_k=0          tile_k=1          tile_k=2          tile_k=3
+//   M=31 [a31_0 ...a31_31 | a31_32 ...a31_63 | a31_64...a31_95| a31_96...a31_127]
+//         \_____________/   \_____________/     \_____________/   \_____________/
+//          32 f16 values     32 f16 values       32 f16 values    32 f16 values
+//
+// Physical layout (output): tiles stored sequentially, M-major within each tile
+//   tile index = tile_m * num_k_tiles + tile_k
+//
+//   Tile (tile_m=0, tile_k=0): 256 u32 = 32 M-rows × 8 u32/row
+//   ┌─────────────────────────────────────────────────────────┐
+//   │ M=0:  u32[0..7] → K[0..3], K[4..7], ... K[28..31]       │ 8 u32 = 32 i8
+//   │ M=1:  u32[8..15]                                        │
+//   │ ...                                                     │
+//   │ M=31: u32[248..255]                                     │
+//   └─────────────────────────────────────────────────────────┘
+//
+//   Thread mapping (kBlockSizeK=128, SIMD=16 → all 16 threads active per M-row):
+//     Thread 0  writes tile_k=0  u32[0..1] (K[0..7])     ← local_idx/4=0, local_idx%4=0
+//     Thread 1  writes tile_k=0  u32[2..3] (K[8..15])    ← local_idx/4=0, local_idx%4=1
+//     Thread 2  writes tile_k=0  u32[4..5] (K[16..23])   ← local_idx/4=0, local_idx%4=2
+//     Thread 3  writes tile_k=0  u32[6..7] (K[24..31])   ← local_idx/4=0, local_idx%4=3
+//     Thread 4  writes tile_k=1  u32[0..1] (K[32..39])   ← local_idx/4=1, local_idx%4=0
+//     ...
+//     Thread 15 writes tile_k=3  u32[6..7] (K[120..127]) ← local_idx/4=3, local_idx%4=3
+//
+// Output: scales_a prepacked [num_tiles_m * num_blocks_k * 32] as f16
+//         (tile_m * num_blocks_k + block_k) * kTileM + m
+//
+// Workgroup: 16 threads (1 subgroup of SIMD=16). All lanes active.
+//   Thread local_idx handles K values [local_idx*8 .. local_idx*8+7] for each M-row.
+//   subgroupMax reduces 16 per-lane max|A| → block-wide max in one operation.
+// Dispatch: (ceil(M/32), K/128, 1)
+
+#use .getByOffset .setByOffset
+
+const kTileM: u32 = 32;
+const kTileK: u32 = 32;
+const kBlockSizeK: u32 = 128u;
+const kSimdWidth: u32 = 16u;
+const kTilesPerBlock: u32 = kBlockSizeK / kTileK;            // 4
+const kQ8ValuesPerU32: u32 = 4u;                             // 4 x 8-bit values packed per u32 (output format)
+const kValuesPerChunk: u32 = 8u;                             // each thread quantizes 8 values (two vec4<f16>)
+const kU32PerTileRow: u32 = kTileK / kQ8ValuesPerU32;       // 8 u32 per M-row in output tile (32 i8 → 8 u32)
+const kChunksPerTile: u32 = kTileK / kValuesPerChunk;       // 4 threads to fill one tile's K dim
+const kU32PerChunk: u32 = kValuesPerChunk / kQ8ValuesPerU32; // 2 u32 written per thread per M-row
+const kChunksPerBlock: u32 = kBlockSizeK / kValuesPerChunk;  // 16 = kSimdWidth (all lanes active)
+
+// Compute output offset for this thread's 2 u32 within the tile buffer.
+//
+// Tile address decomposition from local_idx:
+//   local_idx / kChunksPerTile → which tile within the block (0..3 for kTilesPerBlock=4)
+//   local_idx % kChunksPerTile → which chunk within the tile  (0..3 for kChunksPerTile=4)
+//
+// Example for local_idx=5 (kChunksPerTile=4):
+//   tile_k_in_block = 5/4 = 1 → tile_k=1 (second tile in block)
+//   chunk_in_tile   = 5%4 = 1 → u32 offset = 1*2 = 2 (third and fourth u32 in that row)
+//
+// Final offset into output buffer:
+//   tile_base = (tile_row * num_k_tiles + tile_k) * kTileM * kU32PerTileRow  ← start of tile
+//   row_base  = row * kU32PerTileRow                                         ← row within tile
+//   chunk_off = chunk_in_tile * kU32PerChunk                                 ← position in row
+//   base = tile_base + row_base + chunk_off
+fn get_tile_offset(tile_row: u32, num_k_tiles: u32, first_tile_k: u32,
+                   row: u32, thread_idx: u32) -> u32 {
+    let tile_k = first_tile_k + thread_idx / kChunksPerTile;
+    let tile_base = (tile_row * num_k_tiles + tile_k) * kTileM * kU32PerTileRow;
+    return tile_base + row * kU32PerTileRow + (thread_idx % kChunksPerTile) * kU32PerChunk;
+}
+
+$MAIN {
+    let tile_m = workgroup_id.x;
+    let block_k = workgroup_id.y;
+    let num_k_tiles = uniforms.K / kTileK;
+    let num_blocks_k = uniforms.K / kBlockSizeK;
+    let k_start = block_k * kBlockSizeK;
+    let first_tile_k = block_k * kTilesPerBlock;
+
+    // Single-pass: iterate over M-rows, all 16 subgroup lanes cooperate on each row.
+    // Each thread handles one K-chunk of 8 values. subgroupMax finds the
+    // block-wide max|A|, then each thread quantizes from registers (no re-read).
+    for (var m: u32 = 0u; m < kTileM; m++) {
+        let global_m = tile_m * kTileM + m;
+        let scale_offset = (tile_m * num_blocks_k + block_k) * kTileM + m;
+
+        // Out-of-bounds M: write zeros for tiles and zero scale
+        if (global_m >= uniforms.M) {
+            let base = get_tile_offset(tile_m, num_k_tiles, first_tile_k, m, local_idx);
+            output_a.setByOffset(base, 0u);
+            output_a.setByOffset(base + 1u, 0u);
+            if (local_idx == 0u) {
+                scales_a.setByOffset(scale_offset, input_a_element_t(0));
+            }
+            continue;
+        }
+
+        // Read 8 f16 values (two vec4<f16>) from this thread's K-chunk and find local max
+        let k_pos = k_start + local_idx * kValuesPerChunk;
+        let vec4_base = (global_m * uniforms.K + k_pos) / 4u;
+        let v0 = input_a.getByOffset(vec4_base);
+        let v1 = input_a.getByOffset(vec4_base + 1u);
+
+        let a0 = abs(v0);
+        let a1 = abs(v1);
+        let m01 = max(a0, a1);
+        let m23 = max(m01.xy, m01.zw);
+        let local_max_abs = max(m23.x, m23.y);
+
+        // Subgroup reduction: find block-wide max across all 16 K-chunks for this M-row
+        let block_max_abs = subgroupMax(local_max_abs);
+        let scale = select(block_max_abs, input_a_element_t(1), block_max_abs == input_a_element_t(0));
+
+        // Quantize from registers and write tile output (no second global read)
+        let packed0 = pack4x8snorm(vec4<f32>(v0 / scale));
+        let packed1 = pack4x8snorm(vec4<f32>(v1 / scale));
+
+        let base = get_tile_offset(tile_m, num_k_tiles, first_tile_k, m, local_idx);
+        output_a.setByOffset(base, packed0);
+        output_a.setByOffset(base + 1u, packed1);
+
+        // Write scale for this M-row's block
+        if (local_idx == 0u) {
+            scales_a.setByOffset(scale_offset, scale / 127);
+        }
+    }
+}  // MAIN

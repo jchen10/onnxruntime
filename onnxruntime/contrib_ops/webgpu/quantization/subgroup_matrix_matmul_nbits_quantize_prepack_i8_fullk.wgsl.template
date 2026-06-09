@@ -1,0 +1,88 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// Quantize fp16 A to i8 and prepack into 32x32 tiles for the i8 DPAS path.
+// WHOLE-K variant: a single quantization scale per M-row spans the entire K
+// dimension (one scale block == K). Because the per-row max|A| can only be known
+// after scanning all of K, this is a genuine TWO-PASS kernel:
+//   Pass 1: scan the whole K-row, reduce to one max|A| per row (subgroupMax).
+//   Pass 2: re-read K, divide by the shared scale, pack and write the tiles.
+// (The 128-block kernel quantizes from registers in a single pass; that is not
+//  possible here since one scale covers the full row.)
+//
+// Input:  A [M, K] as f16 (component=4, accessed as vec4<f16>)
+// Output: A_i8 prepacked [num_tiles_m * num_tiles_k * 256] as u32 (32x32 tiles).
+//         Within tile: M-major (M slow, K fast), 8 u32 per M-row (32 i8). This is
+//         exactly what subgroupMatrixLoad expects for row_major, stride=kTileK.
+// Output: scales_a prepacked [num_tiles_m * 32] as f16 — one scale per M-row
+//         (num_blocks_k == 1 for the whole-K layout): scales_a[tile_m * 32 + m].
+//
+// Lane mapping (SIMD=16): the 16 lanes cooperatively stream each K-row in
+// kKPerStep(=128)-wide steps; lane L owns the contiguous K-chunk [L*8, L*8+8).
+// Consecutive lanes therefore touch consecutive K (coalesced global reads).
+//   lane L within a step -> tile_k = step*4 + L/4, k_in_tile = (L%4)*8.
+// Dispatch: (num_tiles_m, 1, 1).
+
+#use .getByOffset .setByOffset
+
+const kTileM: u32 = 32;
+const kTileK: u32 = 32;
+const kSimdWidth: u32 = 16u;
+const kValuesPerLane: u32 = 8u;                       // each lane handles 8 contiguous K (two vec4<f16>)
+const kKPerStep: u32 = kSimdWidth * kValuesPerLane;   // 128 K-values covered per step by the 16 lanes
+const kU32PerTileRow: u32 = kTileK / 4u;              // 8 u32 per M-row in an output tile (32 i8 -> 8 u32)
+const kI32PerTile: u32 = kTileM * kTileK / 4u;        // 256 u32 per 32x32 tile
+
+$MAIN {
+    let tile_m = workgroup_id.x;
+    let num_k_tiles = uniforms.K / kTileK;
+    let num_steps = uniforms.K / kKPerStep;
+
+    // One workgroup owns a 32-row M-tile and the entire K. Iterate the rows.
+    for (var m: u32 = 0u; m < kTileM; m++) {
+        let global_m = tile_m * kTileM + m;
+        let in_range = global_m < uniforms.M;
+
+        // Pass 1: whole-row reduction to a single max|A|.
+        var local_max = input_a_element_t(0);
+        if (in_range) {
+            for (var s: u32 = 0u; s < num_steps; s++) {
+                let k = s * kKPerStep + local_idx * kValuesPerLane;
+                let vec4_base = (global_m * uniforms.K + k) / 4u;
+                let v0 = input_a.getByOffset(vec4_base);
+                let v1 = input_a.getByOffset(vec4_base + 1u);
+                let m01 = max(abs(v0), abs(v1));
+                let m23 = max(m01.xy, m01.zw);
+                local_max = max(local_max, max(m23.x, m23.y));
+            }
+        }
+        let row_max = subgroupMax(local_max);
+        let scale = select(row_max, input_a_element_t(1), row_max == input_a_element_t(0));
+        let inv_scale = input_a_element_t(1) / scale;
+
+        // Write the one per-row scale (any lane holds the reduced value).
+        if (local_idx == 0u) {
+            let scale_offset = tile_m * kTileM + m;
+            scales_a.setByOffset(scale_offset, select(input_a_element_t(0), scale / 127, in_range));
+        }
+
+        // Pass 2: re-read K, quantize against the shared scale and write the tiles.
+        for (var s: u32 = 0u; s < num_steps; s++) {
+            let k = s * kKPerStep + local_idx * kValuesPerLane;
+            let tile_k = k / kTileK;
+            let k_in_tile = k % kTileK;
+            let tile_idx = tile_m * num_k_tiles + tile_k;
+            let out_base = tile_idx * kI32PerTile + m * kU32PerTileRow + k_in_tile / 4u;
+            if (in_range) {
+                let vec4_base = (global_m * uniforms.K + k) / 4u;
+                let v0 = input_a.getByOffset(vec4_base);
+                let v1 = input_a.getByOffset(vec4_base + 1u);
+                output_a.setByOffset(out_base, pack4x8snorm(vec4<f32>(v0 * inv_scale)));
+                output_a.setByOffset(out_base + 1u, pack4x8snorm(vec4<f32>(v1 * inv_scale)));
+            } else {
+                output_a.setByOffset(out_base, 0u);
+                output_a.setByOffset(out_base + 1u, 0u);
+            }
+        }
+    }
+}  // MAIN

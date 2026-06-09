@@ -1,0 +1,147 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// Re-quantize 4-bit B weights to i8 and prepack into 32x32 tiles for the i8 DPAS path.
+// WHOLE-K variant: a single re-quantization scale per N-row spans the entire K
+// dimension (one scale block == K). Because the per-row max|dequant| can only be
+// known after scanning all of K, this is a genuine TWO-PASS kernel:
+//   Pass 1: dequantize the whole K-row, reduce to one max|dequant| per N-row.
+//   Pass 2: re-dequantize K, divide by the shared scale, pack and write the tiles.
+//
+// Input:  B [N, K/8] as u32 (4-bit packed, 8 values per u32), component=4
+// Input:  scales_b [N, K/orig_block_size] as f16 (original 4-bit scales)
+// Input:  zero_points (optional, 4-bit packed)
+// Output: B_i8 prepacked [num_tiles_n * num_tiles_k * 256] as i32 (32x32 tiles).
+//         Within a tile the data is COLUMN-major (N slow, K fast): the 32-wide N tile is
+//         split into two 16-wide halves (matching the two subgroup_matrix_right<i8,16,32>
+//         loads in the matmul); within a half element(k, n_local) lives at i8 offset
+//         n_block*512 + n_local*32 + k. One output i32 packs 4 consecutive K for the same N.
+//         This is exactly what subgroupMatrixLoad expects for col_major=true, stride=32.
+// Output: scales_b prepacked [num_tiles_n * 32] as f16 — one scale per N-row
+//         (num_blocks_k == 1): prepacked_scales_b[tile_n * 32 + n].
+//
+// Lane mapping (SIMD=16): the 16 lanes cooperatively stream each N-row in
+// kKPerStep(=128)-wide steps; lane L owns the contiguous K-chunk [L*8, L*8+8). Because the
+// layout is column-major (K fast), a lane's 8 K-values pack straight into two output i32
+// (4 K each) with no cross-lane transpose. N is walked in groups of 4 only to share the
+// per-row scale reduction (pass 1).
+// Dispatch: (num_tiles_n, 1, 1).
+
+#param has_zero_points
+#param has_weight_idx
+#param has_weight_idx_indirect
+#param n_bits
+#param output_type_i32
+
+#use .getByOffset .setByOffset
+
+#include "quantization/matmul_nbits_zero_pt.wgsl.template"
+
+const kTileN: u32 = 32;
+const kTileK: u32 = 32;
+const kSimdWidth: u32 = 16u;
+const kValuesPerChunk: u32 = 8u;                       // each lane dequantizes 8 K values (one u32 of input)
+const kKPerStep: u32 = kSimdWidth * kValuesPerChunk;   // 128 K-values covered per step by the 16 lanes
+const kQ4ValuesPerU32: u32 = 8u;                       // 8 x 4-bit values packed per u32 (input format)
+const kNGroup: u32 = 4u;                               // 4 N share the pass-1 scale reduction
+const kSgMatN: u32 = 16u;                              // N width of one subgroup_matrix_right<i8,16,32> block
+const kI32PerTile: u32 = kTileN * kTileK / 4u;         // 256 i32 per 32x32 tile (4 i8 per i32)
+
+// Dequantize this lane's 8-value K-chunk [k, k+8) for one N-row from the 4-bit weights.
+fn dequant_chunk(global_n: u32, k: u32, b_offset: u32, scale_b_offset: u32) -> array<scales_b_element_t, 8> {
+    let orig_block_idx = k / uniforms.orig_block_size;
+    let orig_scale = scales_b.getByOffset(global_n * uniforms.orig_blocks_per_col + orig_block_idx + scale_b_offset);
+    let zero = i32(mm_read_zero(global_n, orig_block_idx, uniforms.N, uniforms.zero_blocks_per_col));
+
+    let packed_idx = (global_n * uniforms.K + k) / kQ4ValuesPerU32 + b_offset;
+    let packed_weights = input_b.getByOffset(packed_idx);
+    let lo = unpack4xU8(packed_weights & 0x0F0F0F0Fu);
+    let hi = unpack4xU8((packed_weights >> 4u) & 0x0F0F0F0Fu);
+
+    var d: array<scales_b_element_t, 8>;
+    d[0] = scales_b_element_t(i32(lo[0]) - zero) * orig_scale;
+    d[1] = scales_b_element_t(i32(hi[0]) - zero) * orig_scale;
+    d[2] = scales_b_element_t(i32(lo[1]) - zero) * orig_scale;
+    d[3] = scales_b_element_t(i32(hi[1]) - zero) * orig_scale;
+    d[4] = scales_b_element_t(i32(lo[2]) - zero) * orig_scale;
+    d[5] = scales_b_element_t(i32(hi[2]) - zero) * orig_scale;
+    d[6] = scales_b_element_t(i32(lo[3]) - zero) * orig_scale;
+    d[7] = scales_b_element_t(i32(hi[3]) - zero) * orig_scale;
+    return d;
+}
+
+$MAIN {
+    let tile_n = workgroup_id.x;
+    let num_k_tiles = uniforms.K / kTileK;
+    let num_steps = uniforms.K / kKPerStep;
+
+    // Weight index offset for batched weights.
+#if has_weight_idx
+#if has_weight_idx_indirect
+    let actual_weight_idx = weight_index_indirect[uniforms.weight_idx];
+#else
+    let actual_weight_idx = uniforms.weight_idx;
+#endif
+    let b_offset = actual_weight_idx * uniforms.K * uniforms.N / kQ4ValuesPerU32;
+    let scale_b_offset = actual_weight_idx * uniforms.N * uniforms.orig_blocks_per_col;
+#else
+    const b_offset: u32 = 0;
+    const scale_b_offset: u32 = 0;
+#endif
+
+    // One workgroup owns a 32-row N-tile and the entire K. Walk N in groups of 4
+    // (the group only shares the pass-1 scale reduction; pass 2 writes each N independently).
+    for (var ng: u32 = 0u; ng < kTileN; ng += kNGroup) {
+        let n_block = ng / kSgMatN;        // which 16-wide N half (0 or 1)
+        let n_local_base = ng % kSgMatN;   // 0, 4, 8 or 12 within the half
+
+        // Pass 1: one whole-K scale per N-row of the group.
+        var inv_scale: array<scales_b_element_t, kNGroup>;
+        for (var r: u32 = 0u; r < kNGroup; r++) {
+            let global_n = tile_n * kTileN + ng + r;
+            var local_max = scales_b_element_t(0);
+            if (global_n < uniforms.N) {
+                for (var s: u32 = 0u; s < num_steps; s++) {
+                    let k = s * kKPerStep + local_idx * kValuesPerChunk;
+                    let dq = dequant_chunk(global_n, k, b_offset, scale_b_offset);
+                    let cmax = max(max(max(abs(dq[0]), abs(dq[1])), max(abs(dq[2]), abs(dq[3]))),
+                                   max(max(abs(dq[4]), abs(dq[5])), max(abs(dq[6]), abs(dq[7]))));
+                    local_max = max(local_max, cmax);
+                }
+            }
+            // Uniform subgroup reduction: whole-K max across all 16 K-chunks (and steps).
+            let row_max = subgroupMax(local_max);
+            let new_scale = select(row_max, scales_b_element_t(1), row_max == scales_b_element_t(0));
+            inv_scale[r] = scales_b_element_t(1) / new_scale;
+            if (local_idx == 0u) {
+                let scale_offset = tile_n * kTileN + ng + r;
+                let out_scale = select(scales_b_element_t(0), new_scale / 127, global_n < uniforms.N);
+                prepacked_scales_b.setByOffset(scale_offset, out_scale);
+            }
+        }
+
+        // Pass 2: re-dequantize each step, re-quantize against the shared per-row scale, emit tiles.
+        // Column-major layout: a lane's 8 consecutive K pack into two output i32 (4 K each),
+        // written directly at element(k, n_local) = n_block*128 + n_local*8 + k_in_tile/4 (i32 units).
+        for (var s: u32 = 0u; s < num_steps; s++) {
+            let k = s * kKPerStep + local_idx * kValuesPerChunk;   // start K of this lane's chunk
+            let tile_k = k / kTileK;
+            let k_in_tile = k % kTileK;                            // 0, 8, 16 or 24
+            let out_tile_idx = tile_n * num_k_tiles + tile_k;
+            for (var r: u32 = 0u; r < kNGroup; r++) {
+                let global_n = tile_n * kTileN + ng + r;
+                let n_local = n_local_base + r;                    // 0..15 within the half
+                var dq: array<scales_b_element_t, 8>;
+                if (global_n < uniforms.N) {
+                    dq = dequant_chunk(global_n, k, b_offset, scale_b_offset);
+                }
+                let sc = inv_scale[r];
+                let packed0 = pack4x8snorm(vec4<f32>(f32(dq[0] * sc), f32(dq[1] * sc), f32(dq[2] * sc), f32(dq[3] * sc)));
+                let packed1 = pack4x8snorm(vec4<f32>(f32(dq[4] * sc), f32(dq[5] * sc), f32(dq[6] * sc), f32(dq[7] * sc)));
+                let out_within = n_block * 128u + n_local * 8u + k_in_tile / 4u;
+                output_b.setByOffset(out_tile_idx * kI32PerTile + out_within, bitcast<i32>(packed0));
+                output_b.setByOffset(out_tile_idx * kI32PerTile + out_within + 1u, bitcast<i32>(packed1));
+            }
+        }
+    }
+}  // MAIN

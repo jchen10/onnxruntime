@@ -1,0 +1,244 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// Intel SubgroupMatrix matmul_nbits kernel (int8 quantized A and B path)
+// Uses subgroupMatrixLoad/Store/Multiply with i8 component type for hardware DPAS.
+//
+// A: fp16 input dynamically quantized to int8 (symmetric, block kBlockSizeK), prepacked in 32x32 tiles
+// B: 4-bit weights dequantized to i8 and prepacked in 32x32 tiles (zero points already applied)
+//
+// Workgroup: 32 threads = 1 subgroup (simd32)
+// Tile: kTileM(32) x kTileN(32)
+// Single subgroup handles 4 x kSgMatM(8) M rows x 2 x kSgMatN(16) N columns
+// K dimension iterated in kTileK(32) blocks
+//
+// Strategy: Two-level K loop.
+//   Outer loop: iterates over scale blocks (kBlockSizeK K-columns each).
+//   Inner loop: iterates kTilesPerBlock tiles within a block, accumulating i32 DPAS results
+//     in registers via subgroupMatrixMultiplyAccumulate (no SLM, no scale).
+//   At each scale block boundary: flush to SLM, apply scales, accumulate into f16.
+//
+// When kBlockSizeK > 32 (e.g., 128, 256), the scale overhead is amortized over
+// kTilesPerBlock iterations, turning the ~32% scale cost from L14 into ~8% or less.
+//
+// M-loop: Sequential loop over M-tiles within each workgroup. Dispatch Y is capped
+// to target hardware occupancy, and each workgroup processes a contiguous block of M-tiles.
+// This avoids excessive dispatch overhead for large M while maintaining full hardware occupancy.
+
+#param has_bias
+#param has_weight_idx
+#param has_weight_idx_indirect
+#param block_size_k
+
+#use .getByOffset .setByOffset
+
+const kTileM: u32 = 32;
+const kTileN: u32 = 32;
+const kTileK: u32 = 32;
+const kSgMatM: u32 = 8;
+const kSgMatN: u32 = 16;
+const kSgMatK: u32 = 32;
+const kSgMatCountM: u32 = kTileM / kSgMatM;      // 4
+const kSgMatCountN: u32 = kTileN / kSgMatN;      // 2
+const kBlockSizeK: u32 = u32(block_size_k);        // quantization block size in K dimension
+const kTilesPerBlock: u32 = kBlockSizeK / kTileK; // how many 32-col tiles per scale block
+
+// SLM for 32x32 tile in column-major layout (stride kTileM=32).
+// Thread t reads row t from all 32 columns.
+// 32 * 32 = 1024 i32 = 4 KB.
+var<workgroup> tile_result: array<i32, kTileM * kTileN>;
+
+$MAIN {
+    let global_base_b = workgroup_id.x * kTileN;
+    let num_k_tiles = uniforms.K / kTileK;
+    let num_tiles_m = (uniforms.M + kTileM - 1) / kTileM;
+
+    // Sequential M-loop: each workgroup processes a contiguous block of M-tiles.
+    let m_start = workgroup_id.y * uniforms.m_tiles_per_wg;
+    let m_end = min(m_start + uniforms.m_tiles_per_wg, num_tiles_m);
+    for (var m_tile: u32 = m_start; m_tile < m_end; m_tile++) {
+        let global_base_a = m_tile * kTileM;
+
+        // Per-thread f16 accumulators: thread t accumulates M row t, all 32 N columns.
+        var acc = array<f16, kTileN>();
+
+        // Outer loop: iterate over scale blocks.
+        for (var block_start: u32 = 0; block_start < uniforms.K; block_start += kBlockSizeK) {
+            // Load scales once per block. Thread i holds sa[i] and sb[i].
+            let block_idx = block_start / kBlockSizeK;
+            let num_blocks = uniforms.K / kBlockSizeK;
+            let sa_block_base = (m_tile * num_blocks + block_idx) * kTileM;
+            let sb_block_base = (workgroup_id.x * num_blocks + block_idx) * kTileN;
+            let sa_local = scales_a.getByOffset(sa_block_base + local_idx);
+            let sb_local = scales_b.getByOffset(sb_block_base + local_idx);
+
+            // i32 DPAS accumulators: persist across inner tiles, zeroed each block.
+            var sg_mat_c00: subgroup_matrix_result<i32, 16, 8>;
+            var sg_mat_c01: subgroup_matrix_result<i32, 16, 8>;
+            var sg_mat_c10: subgroup_matrix_result<i32, 16, 8>;
+            var sg_mat_c11: subgroup_matrix_result<i32, 16, 8>;
+            var sg_mat_c20: subgroup_matrix_result<i32, 16, 8>;
+            var sg_mat_c21: subgroup_matrix_result<i32, 16, 8>;
+            var sg_mat_c30: subgroup_matrix_result<i32, 16, 8>;
+            var sg_mat_c31: subgroup_matrix_result<i32, 16, 8>;
+
+            // Inner loop: accumulate DPAS results across tiles within this block.
+            // First iteration uses non-accumulating multiply, rest use multiply-accumulate.
+            for (var t: u32 = 0; t < kTilesPerBlock; t++) {
+                let k_tile = block_start / kTileK + t;
+
+                // Load both B blocks from prepacked global memory.
+                let tile_b_base = (workgroup_id.x * num_k_tiles + k_tile) * kTileN * kTileK;
+                var sg_mat_b0: subgroup_matrix_right<i8, 16, 32> =
+                    subgroupMatrixLoad<subgroup_matrix_right<i8, 16, 32>>(
+                        &input_b, tile_b_base, false, kSgMatN);
+                var sg_mat_b1: subgroup_matrix_right<i8, 16, 32> =
+                    subgroupMatrixLoad<subgroup_matrix_right<i8, 16, 32>>(
+                        &input_b, tile_b_base + kSgMatN * kSgMatK, false, kSgMatN);
+
+                // Load all 4 A blocks.
+                let tile_a_base = (m_tile * num_k_tiles + k_tile) * kTileM * kTileK;
+                var sg_mat_a0: subgroup_matrix_left<i8, 32, 8> =
+                    subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(
+                        &input_a, tile_a_base, false, kSgMatK);
+                var sg_mat_a1: subgroup_matrix_left<i8, 32, 8> =
+                    subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(
+                        &input_a, tile_a_base + kSgMatM * kSgMatK, false, kSgMatK);
+                var sg_mat_a2: subgroup_matrix_left<i8, 32, 8> =
+                    subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(
+                        &input_a, tile_a_base + 2 * kSgMatM * kSgMatK, false, kSgMatK);
+                var sg_mat_a3: subgroup_matrix_left<i8, 32, 8> =
+                    subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(
+                        &input_a, tile_a_base + 3 * kSgMatM * kSgMatK, false, kSgMatK);
+
+                // 8 DPASes: accumulate into c registers.
+                if (t == 0) {
+                    // First tile: non-accumulating (C = A * B).
+                    sg_mat_c00 = subgroupMatrixMultiply<i32>(sg_mat_a0, sg_mat_b0);
+                    sg_mat_c01 = subgroupMatrixMultiply<i32>(sg_mat_a0, sg_mat_b1);
+                    sg_mat_c10 = subgroupMatrixMultiply<i32>(sg_mat_a1, sg_mat_b0);
+                    sg_mat_c11 = subgroupMatrixMultiply<i32>(sg_mat_a1, sg_mat_b1);
+                    sg_mat_c20 = subgroupMatrixMultiply<i32>(sg_mat_a2, sg_mat_b0);
+                    sg_mat_c21 = subgroupMatrixMultiply<i32>(sg_mat_a2, sg_mat_b1);
+                    sg_mat_c30 = subgroupMatrixMultiply<i32>(sg_mat_a3, sg_mat_b0);
+                    sg_mat_c31 = subgroupMatrixMultiply<i32>(sg_mat_a3, sg_mat_b1);
+                } else {
+                    // Subsequent tiles: accumulate (C += A * B).
+                    sg_mat_c00 = subgroupMatrixMultiplyAccumulate(sg_mat_a0, sg_mat_b0, sg_mat_c00);
+                    sg_mat_c01 = subgroupMatrixMultiplyAccumulate(sg_mat_a0, sg_mat_b1, sg_mat_c01);
+                    sg_mat_c10 = subgroupMatrixMultiplyAccumulate(sg_mat_a1, sg_mat_b0, sg_mat_c10);
+                    sg_mat_c11 = subgroupMatrixMultiplyAccumulate(sg_mat_a1, sg_mat_b1, sg_mat_c11);
+                    sg_mat_c20 = subgroupMatrixMultiplyAccumulate(sg_mat_a2, sg_mat_b0, sg_mat_c20);
+                    sg_mat_c21 = subgroupMatrixMultiplyAccumulate(sg_mat_a2, sg_mat_b1, sg_mat_c21);
+                    sg_mat_c30 = subgroupMatrixMultiplyAccumulate(sg_mat_a3, sg_mat_b0, sg_mat_c30);
+                    sg_mat_c31 = subgroupMatrixMultiplyAccumulate(sg_mat_a3, sg_mat_b1, sg_mat_c31);
+                }
+            } // end inner K-tile loop
+
+            // Flush i32 DPAS results to SLM in column-major layout (stride kTileM=32).
+            subgroupMatrixStore(&tile_result, 0, sg_mat_c00, true, kTileM);
+            subgroupMatrixStore(&tile_result, kSgMatM, sg_mat_c10, true, kTileM);
+            subgroupMatrixStore(&tile_result, 2 * kSgMatM, sg_mat_c20, true, kTileM);
+            subgroupMatrixStore(&tile_result, 3 * kSgMatM, sg_mat_c30, true, kTileM);
+            subgroupMatrixStore(&tile_result, kSgMatN * kTileM, sg_mat_c01, true, kTileM);
+            subgroupMatrixStore(&tile_result, kSgMatN * kTileM + kSgMatM, sg_mat_c11, true, kTileM);
+            subgroupMatrixStore(&tile_result, kSgMatN * kTileM + 2 * kSgMatM, sg_mat_c21, true, kTileM);
+            subgroupMatrixStore(&tile_result, kSgMatN * kTileM + 3 * kSgMatM, sg_mat_c31, true, kTileM);
+
+            // Scale products for all 32 columns (sa × sb broadcast).
+            let sc0  = sa_local * subgroupShuffle(sb_local, 0);
+            let sc1  = sa_local * subgroupShuffle(sb_local, 1);
+            let sc2  = sa_local * subgroupShuffle(sb_local, 2);
+            let sc3  = sa_local * subgroupShuffle(sb_local, 3);
+            let sc4  = sa_local * subgroupShuffle(sb_local, 4);
+            let sc5  = sa_local * subgroupShuffle(sb_local, 5);
+            let sc6  = sa_local * subgroupShuffle(sb_local, 6);
+            let sc7  = sa_local * subgroupShuffle(sb_local, 7);
+            let sc8  = sa_local * subgroupShuffle(sb_local, 8);
+            let sc9  = sa_local * subgroupShuffle(sb_local, 9);
+            let sc10 = sa_local * subgroupShuffle(sb_local, 10);
+            let sc11 = sa_local * subgroupShuffle(sb_local, 11);
+            let sc12 = sa_local * subgroupShuffle(sb_local, 12);
+            let sc13 = sa_local * subgroupShuffle(sb_local, 13);
+            let sc14 = sa_local * subgroupShuffle(sb_local, 14);
+            let sc15 = sa_local * subgroupShuffle(sb_local, 15);
+            let sc16 = sa_local * subgroupShuffle(sb_local, 16);
+            let sc17 = sa_local * subgroupShuffle(sb_local, 17);
+            let sc18 = sa_local * subgroupShuffle(sb_local, 18);
+            let sc19 = sa_local * subgroupShuffle(sb_local, 19);
+            let sc20 = sa_local * subgroupShuffle(sb_local, 20);
+            let sc21 = sa_local * subgroupShuffle(sb_local, 21);
+            let sc22 = sa_local * subgroupShuffle(sb_local, 22);
+            let sc23 = sa_local * subgroupShuffle(sb_local, 23);
+            let sc24 = sa_local * subgroupShuffle(sb_local, 24);
+            let sc25 = sa_local * subgroupShuffle(sb_local, 25);
+            let sc26 = sa_local * subgroupShuffle(sb_local, 26);
+            let sc27 = sa_local * subgroupShuffle(sb_local, 27);
+            let sc28 = sa_local * subgroupShuffle(sb_local, 28);
+            let sc29 = sa_local * subgroupShuffle(sb_local, 29);
+            let sc30 = sa_local * subgroupShuffle(sb_local, 30);
+            let sc31 = sa_local * subgroupShuffle(sb_local, 31);
+
+            // Read SLM in column-major layout and accumulate with scales into f16.
+            // Element(row, col) = tile_result[col * kTileM + row].
+            // Thread local_idx reads its own row from all 32 columns.
+            acc[0]  += f16(f32(tile_result[0  * kTileM + local_idx]) * f32(sc0));
+            acc[1]  += f16(f32(tile_result[1  * kTileM + local_idx]) * f32(sc1));
+            acc[2]  += f16(f32(tile_result[2  * kTileM + local_idx]) * f32(sc2));
+            acc[3]  += f16(f32(tile_result[3  * kTileM + local_idx]) * f32(sc3));
+            acc[4]  += f16(f32(tile_result[4  * kTileM + local_idx]) * f32(sc4));
+            acc[5]  += f16(f32(tile_result[5  * kTileM + local_idx]) * f32(sc5));
+            acc[6]  += f16(f32(tile_result[6  * kTileM + local_idx]) * f32(sc6));
+            acc[7]  += f16(f32(tile_result[7  * kTileM + local_idx]) * f32(sc7));
+            acc[8]  += f16(f32(tile_result[8  * kTileM + local_idx]) * f32(sc8));
+            acc[9]  += f16(f32(tile_result[9  * kTileM + local_idx]) * f32(sc9));
+            acc[10] += f16(f32(tile_result[10 * kTileM + local_idx]) * f32(sc10));
+            acc[11] += f16(f32(tile_result[11 * kTileM + local_idx]) * f32(sc11));
+            acc[12] += f16(f32(tile_result[12 * kTileM + local_idx]) * f32(sc12));
+            acc[13] += f16(f32(tile_result[13 * kTileM + local_idx]) * f32(sc13));
+            acc[14] += f16(f32(tile_result[14 * kTileM + local_idx]) * f32(sc14));
+            acc[15] += f16(f32(tile_result[15 * kTileM + local_idx]) * f32(sc15));
+            acc[16] += f16(f32(tile_result[16 * kTileM + local_idx]) * f32(sc16));
+            acc[17] += f16(f32(tile_result[17 * kTileM + local_idx]) * f32(sc17));
+            acc[18] += f16(f32(tile_result[18 * kTileM + local_idx]) * f32(sc18));
+            acc[19] += f16(f32(tile_result[19 * kTileM + local_idx]) * f32(sc19));
+            acc[20] += f16(f32(tile_result[20 * kTileM + local_idx]) * f32(sc20));
+            acc[21] += f16(f32(tile_result[21 * kTileM + local_idx]) * f32(sc21));
+            acc[22] += f16(f32(tile_result[22 * kTileM + local_idx]) * f32(sc22));
+            acc[23] += f16(f32(tile_result[23 * kTileM + local_idx]) * f32(sc23));
+            acc[24] += f16(f32(tile_result[24 * kTileM + local_idx]) * f32(sc24));
+            acc[25] += f16(f32(tile_result[25 * kTileM + local_idx]) * f32(sc25));
+            acc[26] += f16(f32(tile_result[26 * kTileM + local_idx]) * f32(sc26));
+            acc[27] += f16(f32(tile_result[27 * kTileM + local_idx]) * f32(sc27));
+            acc[28] += f16(f32(tile_result[28 * kTileM + local_idx]) * f32(sc28));
+            acc[29] += f16(f32(tile_result[29 * kTileM + local_idx]) * f32(sc29));
+            acc[30] += f16(f32(tile_result[30 * kTileM + local_idx]) * f32(sc30));
+            acc[31] += f16(f32(tile_result[31 * kTileM + local_idx]) * f32(sc31));
+        } // end outer block loop
+
+        // Write final f16 results to output.
+        // Thread t writes M row (global_base_a + t), all 32 N columns.
+        let global_m = global_base_a + local_idx;
+#if has_bias
+#if has_weight_idx_indirect
+        let bias_offset = weight_index_indirect[uniforms.weight_idx] * uniforms.N;
+#elif has_weight_idx
+        let bias_offset = uniforms.weight_idx * uniforms.N;
+#else
+        const bias_offset: u32 = 0;
+#endif
+#endif
+        if (global_m < uniforms.M) {
+            for (var n: u32 = 0; n < kTileN; n++) {
+                let global_n = global_base_b + n;
+                if (global_n < uniforms.N) {
+                    var val = output_element_t(acc[n]);
+#if has_bias
+                    val += bias[bias_offset + global_n];
+#endif
+                    output.setByOffset(global_m * uniforms.N + global_n, val);
+                }
+            }
+        }
+    } // end M-tile loop
+}  // MAIN

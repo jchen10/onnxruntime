@@ -1,0 +1,302 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// Intel SubgroupMatrix matmul_nbits kernel (int8 A and B path) - WHOLE-K variant, 64x32 TILE.
+// This is the whole-K (USE_SG_MAT_INT8_FULLK=1) i8 DPAS matmul.
+//
+// Same DPAS primitive (left<i8,32,8> x right<i8,16,32> -> result<i32,16,8>, an 8x16 output) but a
+// different output tiling: a single simd32 subgroup produces a 64x32 result tile instead of 32x32.
+//   - kTileM(64) = 8 x kSgMatM(8) M-row blocks  (kSgMatCountM = 8)
+//   - kTileN(32) = 2 x kSgMatN(16) N-col blocks (kSgMatCountN = 2, both b0 and b1)
+//   - 16 DPAS / K-tile and 16 i32 accumulators (8 A-blocks x 2 B-blocks). This is the 32x32
+//     kernel with M doubled to 64: 8 A-loads + 2 B-loads per K-tile produce 16 outputs, so B
+//     reuse improves to 1 load : 8 DPAS (was 1 : 4) and A reuse stays 1 load : 2 DPAS. The
+//     largest tile of the family -- best arithmetic intensity, highest register/SLM pressure.
+//
+// PREPACK COMPATIBILITY: this kernel consumes the SAME 32x32 prepacked A/B buffers and per-row
+// scales as the 32x32 kernel -- nothing in the prepack changes. A 64-row M-tile spans the two
+// adjacent 32-row prepack tiles (2*m_tile and 2*m_tile+1); a 32-col N-tile is exactly one 32-col
+// prepack B tile (workgroup_id.x). The host MUST pad A to a multiple of 64 (an even number of 32
+// row-tiles) so the upper 32-tile always exists; padded rows carry scale 0 (same as the 64x16).
+//
+// Workgroup: 32 threads = 1 subgroup (simd32). Thread t owns M rows t and t+32 (64 rows / 32 lanes),
+// all 32 N columns. M-loop: sequential over M-tiles within each workgroup (occupancy strategy as
+// the 32x32 kernel).
+
+#param has_bias
+#param has_weight_idx
+#param has_weight_idx_indirect
+
+#use .getByOffset .setByOffset
+
+const kTileM: u32 = 64;
+const kTileN: u32 = 32;
+const kTileK: u32 = 32;
+const kSgMatM: u32 = 8;
+const kSgMatN: u32 = 16;
+const kSgMatK: u32 = 32;
+const kSgMatCountM: u32 = kTileM / kSgMatM;      // 8
+const kSgMatCountN: u32 = kTileN / kSgMatN;      // 2
+
+// Layout constants for the SHARED 32x32 prepack buffers (unchanged from the 32x32 kernel).
+const kPrepackTile: u32 = 32;                    // prepack tiles are 32x32
+const kPrepackTileI8: u32 = kPrepackTile * kTileK;  // 1024 i8 per prepacked 32x32 tile
+const kABlockI8: u32 = kSgMatM * kSgMatK;        // 256 i8 stride between A row-blocks
+const kBHalfI8: u32 = kSgMatN * kSgMatK;         // 512 i8 offset of the 2nd 16-wide B half
+
+// SLM for the 64x32 result tile in column-major layout (stride kTileM=64).
+// element(row, col) lives at tile_result[col * kTileM + row]. 64 * 32 = 2048 i32 = 8 KB.
+var<workgroup> tile_result: array<i32, kTileM * kTileN>;
+
+$MAIN {
+    let global_base_b = workgroup_id.x * kTileN;            // first N column of this 32-wide tile
+    let num_k_tiles = uniforms.K / kTileK;
+    let num_tiles_m = (uniforms.M + kTileM - 1) / kTileM;   // 64-row M-tiles
+
+    // Sequential M-loop: each workgroup processes a contiguous block of 64-row M-tiles.
+    let m_start = workgroup_id.y * uniforms.m_tiles_per_wg;
+    let m_end = min(m_start + uniforms.m_tiles_per_wg, num_tiles_m);
+    for (var m_tile: u32 = m_start; m_tile < m_end; m_tile++) {
+        let global_base_a = m_tile * kTileM;
+        // The two 32-row prepack tiles that make up this 64-row M-tile.
+        let m_prepack_lo = 2u * m_tile;
+        let m_prepack_hi = 2u * m_tile + 1u;
+
+        // Whole-K scales: one scale block, so num_blocks == 1. scales_a/scales_b are indexed by the
+        // GLOBAL row/col, so thread local_idx loads M rows local_idx and local_idx+32, and N col
+        // local_idx (all 32 lanes hold a valid column for the 32-wide N tile).
+        let sa_lo = scales_a.getByOffset(global_base_a + local_idx);
+        let sa_hi = scales_a.getByOffset(global_base_a + 32u + local_idx);
+        let sb_local = scales_b.getByOffset(global_base_b + local_idx);
+
+        // i32 DPAS accumulators: 8 M-blocks x 2 N-blocks. cMN holds M-block M, N-block N.
+        // Zero-initialized so the K loop can unconditionally accumulate (straight-line DPAS body).
+        var sg_mat_zero: subgroup_matrix_result<i32, 16, 8>;
+        var sg_mat_c00 = sg_mat_zero;
+        var sg_mat_c01 = sg_mat_zero;
+        var sg_mat_c10 = sg_mat_zero;
+        var sg_mat_c11 = sg_mat_zero;
+        var sg_mat_c20 = sg_mat_zero;
+        var sg_mat_c21 = sg_mat_zero;
+        var sg_mat_c30 = sg_mat_zero;
+        var sg_mat_c31 = sg_mat_zero;
+        var sg_mat_c40 = sg_mat_zero;
+        var sg_mat_c41 = sg_mat_zero;
+        var sg_mat_c50 = sg_mat_zero;
+        var sg_mat_c51 = sg_mat_zero;
+        var sg_mat_c60 = sg_mat_zero;
+        var sg_mat_c61 = sg_mat_zero;
+        var sg_mat_c70 = sg_mat_zero;
+        var sg_mat_c71 = sg_mat_zero;
+
+        for (var k_tile: u32 = 0; k_tile < num_k_tiles; k_tile++) {
+            // Both 16-wide B blocks from the single 32-col prepack tile (column-major, K fast).
+            let tile_b_base = (workgroup_id.x * num_k_tiles + k_tile) * kPrepackTileI8;
+            var sg_mat_b0: subgroup_matrix_right<i8, 16, 32> =
+                subgroupMatrixLoad<subgroup_matrix_right<i8, 16, 32>>(&input_b, tile_b_base, true, kSgMatK);
+            var sg_mat_b1: subgroup_matrix_right<i8, 16, 32> =
+                subgroupMatrixLoad<subgroup_matrix_right<i8, 16, 32>>(&input_b, tile_b_base + kBHalfI8, true, kSgMatK);
+
+            // 8 A row-blocks: 4 from the lower 32-row prepack tile, 4 from the upper one.
+            let tile_a_base_lo = (m_prepack_lo * num_k_tiles + k_tile) * kPrepackTileI8;
+            let tile_a_base_hi = (m_prepack_hi * num_k_tiles + k_tile) * kPrepackTileI8;
+            var sg_mat_a0: subgroup_matrix_left<i8, 32, 8> =
+                subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(&input_a, tile_a_base_lo, false, kSgMatK);
+            var sg_mat_a1: subgroup_matrix_left<i8, 32, 8> =
+                subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(&input_a, tile_a_base_lo + kABlockI8, false, kSgMatK);
+            var sg_mat_a2: subgroup_matrix_left<i8, 32, 8> =
+                subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(&input_a, tile_a_base_lo + 2u * kABlockI8, false, kSgMatK);
+            var sg_mat_a3: subgroup_matrix_left<i8, 32, 8> =
+                subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(&input_a, tile_a_base_lo + 3u * kABlockI8, false, kSgMatK);
+            var sg_mat_a4: subgroup_matrix_left<i8, 32, 8> =
+                subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(&input_a, tile_a_base_hi, false, kSgMatK);
+            var sg_mat_a5: subgroup_matrix_left<i8, 32, 8> =
+                subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(&input_a, tile_a_base_hi + kABlockI8, false, kSgMatK);
+            var sg_mat_a6: subgroup_matrix_left<i8, 32, 8> =
+                subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(&input_a, tile_a_base_hi + 2u * kABlockI8, false, kSgMatK);
+            var sg_mat_a7: subgroup_matrix_left<i8, 32, 8> =
+                subgroupMatrixLoad<subgroup_matrix_left<i8, 32, 8>>(&input_a, tile_a_base_hi + 3u * kABlockI8, false, kSgMatK);
+
+            // 16 DPASes into the (zero-initialized) c registers: 8 A-blocks x 2 B-blocks.
+            sg_mat_c00 = subgroupMatrixMultiplyAccumulate(sg_mat_a0, sg_mat_b0, sg_mat_c00);
+            sg_mat_c01 = subgroupMatrixMultiplyAccumulate(sg_mat_a0, sg_mat_b1, sg_mat_c01);
+            sg_mat_c10 = subgroupMatrixMultiplyAccumulate(sg_mat_a1, sg_mat_b0, sg_mat_c10);
+            sg_mat_c11 = subgroupMatrixMultiplyAccumulate(sg_mat_a1, sg_mat_b1, sg_mat_c11);
+            sg_mat_c20 = subgroupMatrixMultiplyAccumulate(sg_mat_a2, sg_mat_b0, sg_mat_c20);
+            sg_mat_c21 = subgroupMatrixMultiplyAccumulate(sg_mat_a2, sg_mat_b1, sg_mat_c21);
+            sg_mat_c30 = subgroupMatrixMultiplyAccumulate(sg_mat_a3, sg_mat_b0, sg_mat_c30);
+            sg_mat_c31 = subgroupMatrixMultiplyAccumulate(sg_mat_a3, sg_mat_b1, sg_mat_c31);
+            sg_mat_c40 = subgroupMatrixMultiplyAccumulate(sg_mat_a4, sg_mat_b0, sg_mat_c40);
+            sg_mat_c41 = subgroupMatrixMultiplyAccumulate(sg_mat_a4, sg_mat_b1, sg_mat_c41);
+            sg_mat_c50 = subgroupMatrixMultiplyAccumulate(sg_mat_a5, sg_mat_b0, sg_mat_c50);
+            sg_mat_c51 = subgroupMatrixMultiplyAccumulate(sg_mat_a5, sg_mat_b1, sg_mat_c51);
+            sg_mat_c60 = subgroupMatrixMultiplyAccumulate(sg_mat_a6, sg_mat_b0, sg_mat_c60);
+            sg_mat_c61 = subgroupMatrixMultiplyAccumulate(sg_mat_a6, sg_mat_b1, sg_mat_c61);
+            sg_mat_c70 = subgroupMatrixMultiplyAccumulate(sg_mat_a7, sg_mat_b0, sg_mat_c70);
+            sg_mat_c71 = subgroupMatrixMultiplyAccumulate(sg_mat_a7, sg_mat_b1, sg_mat_c71);
+        } // end K-tile loop
+
+        // Flush i32 DPAS results to SLM in column-major layout (stride kTileM=64). ONCE.
+        // Block (m,n) owns rows [m*8, m*8+8) of cols [n*16, n*16+16):
+        //   offset = n * kSgMatN * kTileM + m * kSgMatM.
+        subgroupMatrixStore(&tile_result, 0u, sg_mat_c00, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatM, sg_mat_c10, true, kTileM);
+        subgroupMatrixStore(&tile_result, 2u * kSgMatM, sg_mat_c20, true, kTileM);
+        subgroupMatrixStore(&tile_result, 3u * kSgMatM, sg_mat_c30, true, kTileM);
+        subgroupMatrixStore(&tile_result, 4u * kSgMatM, sg_mat_c40, true, kTileM);
+        subgroupMatrixStore(&tile_result, 5u * kSgMatM, sg_mat_c50, true, kTileM);
+        subgroupMatrixStore(&tile_result, 6u * kSgMatM, sg_mat_c60, true, kTileM);
+        subgroupMatrixStore(&tile_result, 7u * kSgMatM, sg_mat_c70, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatN * kTileM, sg_mat_c01, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatN * kTileM + kSgMatM, sg_mat_c11, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatN * kTileM + 2u * kSgMatM, sg_mat_c21, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatN * kTileM + 3u * kSgMatM, sg_mat_c31, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatN * kTileM + 4u * kSgMatM, sg_mat_c41, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatN * kTileM + 5u * kSgMatM, sg_mat_c51, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatN * kTileM + 6u * kSgMatM, sg_mat_c61, true, kTileM);
+        subgroupMatrixStore(&tile_result, kSgMatN * kTileM + 7u * kSgMatM, sg_mat_c71, true, kTileM);
+
+        // Per-column scale (broadcast sb from lane n). 32 columns.
+        let sb0  = subgroupShuffle(sb_local, 0);
+        let sb1  = subgroupShuffle(sb_local, 1);
+        let sb2  = subgroupShuffle(sb_local, 2);
+        let sb3  = subgroupShuffle(sb_local, 3);
+        let sb4  = subgroupShuffle(sb_local, 4);
+        let sb5  = subgroupShuffle(sb_local, 5);
+        let sb6  = subgroupShuffle(sb_local, 6);
+        let sb7  = subgroupShuffle(sb_local, 7);
+        let sb8  = subgroupShuffle(sb_local, 8);
+        let sb9  = subgroupShuffle(sb_local, 9);
+        let sb10 = subgroupShuffle(sb_local, 10);
+        let sb11 = subgroupShuffle(sb_local, 11);
+        let sb12 = subgroupShuffle(sb_local, 12);
+        let sb13 = subgroupShuffle(sb_local, 13);
+        let sb14 = subgroupShuffle(sb_local, 14);
+        let sb15 = subgroupShuffle(sb_local, 15);
+        let sb16 = subgroupShuffle(sb_local, 16);
+        let sb17 = subgroupShuffle(sb_local, 17);
+        let sb18 = subgroupShuffle(sb_local, 18);
+        let sb19 = subgroupShuffle(sb_local, 19);
+        let sb20 = subgroupShuffle(sb_local, 20);
+        let sb21 = subgroupShuffle(sb_local, 21);
+        let sb22 = subgroupShuffle(sb_local, 22);
+        let sb23 = subgroupShuffle(sb_local, 23);
+        let sb24 = subgroupShuffle(sb_local, 24);
+        let sb25 = subgroupShuffle(sb_local, 25);
+        let sb26 = subgroupShuffle(sb_local, 26);
+        let sb27 = subgroupShuffle(sb_local, 27);
+        let sb28 = subgroupShuffle(sb_local, 28);
+        let sb29 = subgroupShuffle(sb_local, 29);
+        let sb30 = subgroupShuffle(sb_local, 30);
+        let sb31 = subgroupShuffle(sb_local, 31);
+
+        // Read SLM (column-major: element(row,col)=tile_result[col*kTileM+row]) and apply scales.
+        // Thread local_idx produces row local_idx (lo) and row local_idx+32 (hi), all 32 columns.
+        let row_lo = local_idx;
+        let row_hi = 32u + local_idx;
+        var acc_lo = array<f16, kTileN>();
+        var acc_hi = array<f16, kTileN>();
+        acc_lo[0]  = f16(f32(tile_result[0u  * kTileM + row_lo]) * f32(sa_lo * sb0));
+        acc_lo[1]  = f16(f32(tile_result[1u  * kTileM + row_lo]) * f32(sa_lo * sb1));
+        acc_lo[2]  = f16(f32(tile_result[2u  * kTileM + row_lo]) * f32(sa_lo * sb2));
+        acc_lo[3]  = f16(f32(tile_result[3u  * kTileM + row_lo]) * f32(sa_lo * sb3));
+        acc_lo[4]  = f16(f32(tile_result[4u  * kTileM + row_lo]) * f32(sa_lo * sb4));
+        acc_lo[5]  = f16(f32(tile_result[5u  * kTileM + row_lo]) * f32(sa_lo * sb5));
+        acc_lo[6]  = f16(f32(tile_result[6u  * kTileM + row_lo]) * f32(sa_lo * sb6));
+        acc_lo[7]  = f16(f32(tile_result[7u  * kTileM + row_lo]) * f32(sa_lo * sb7));
+        acc_lo[8]  = f16(f32(tile_result[8u  * kTileM + row_lo]) * f32(sa_lo * sb8));
+        acc_lo[9]  = f16(f32(tile_result[9u  * kTileM + row_lo]) * f32(sa_lo * sb9));
+        acc_lo[10] = f16(f32(tile_result[10u * kTileM + row_lo]) * f32(sa_lo * sb10));
+        acc_lo[11] = f16(f32(tile_result[11u * kTileM + row_lo]) * f32(sa_lo * sb11));
+        acc_lo[12] = f16(f32(tile_result[12u * kTileM + row_lo]) * f32(sa_lo * sb12));
+        acc_lo[13] = f16(f32(tile_result[13u * kTileM + row_lo]) * f32(sa_lo * sb13));
+        acc_lo[14] = f16(f32(tile_result[14u * kTileM + row_lo]) * f32(sa_lo * sb14));
+        acc_lo[15] = f16(f32(tile_result[15u * kTileM + row_lo]) * f32(sa_lo * sb15));
+        acc_lo[16] = f16(f32(tile_result[16u * kTileM + row_lo]) * f32(sa_lo * sb16));
+        acc_lo[17] = f16(f32(tile_result[17u * kTileM + row_lo]) * f32(sa_lo * sb17));
+        acc_lo[18] = f16(f32(tile_result[18u * kTileM + row_lo]) * f32(sa_lo * sb18));
+        acc_lo[19] = f16(f32(tile_result[19u * kTileM + row_lo]) * f32(sa_lo * sb19));
+        acc_lo[20] = f16(f32(tile_result[20u * kTileM + row_lo]) * f32(sa_lo * sb20));
+        acc_lo[21] = f16(f32(tile_result[21u * kTileM + row_lo]) * f32(sa_lo * sb21));
+        acc_lo[22] = f16(f32(tile_result[22u * kTileM + row_lo]) * f32(sa_lo * sb22));
+        acc_lo[23] = f16(f32(tile_result[23u * kTileM + row_lo]) * f32(sa_lo * sb23));
+        acc_lo[24] = f16(f32(tile_result[24u * kTileM + row_lo]) * f32(sa_lo * sb24));
+        acc_lo[25] = f16(f32(tile_result[25u * kTileM + row_lo]) * f32(sa_lo * sb25));
+        acc_lo[26] = f16(f32(tile_result[26u * kTileM + row_lo]) * f32(sa_lo * sb26));
+        acc_lo[27] = f16(f32(tile_result[27u * kTileM + row_lo]) * f32(sa_lo * sb27));
+        acc_lo[28] = f16(f32(tile_result[28u * kTileM + row_lo]) * f32(sa_lo * sb28));
+        acc_lo[29] = f16(f32(tile_result[29u * kTileM + row_lo]) * f32(sa_lo * sb29));
+        acc_lo[30] = f16(f32(tile_result[30u * kTileM + row_lo]) * f32(sa_lo * sb30));
+        acc_lo[31] = f16(f32(tile_result[31u * kTileM + row_lo]) * f32(sa_lo * sb31));
+        acc_hi[0]  = f16(f32(tile_result[0u  * kTileM + row_hi]) * f32(sa_hi * sb0));
+        acc_hi[1]  = f16(f32(tile_result[1u  * kTileM + row_hi]) * f32(sa_hi * sb1));
+        acc_hi[2]  = f16(f32(tile_result[2u  * kTileM + row_hi]) * f32(sa_hi * sb2));
+        acc_hi[3]  = f16(f32(tile_result[3u  * kTileM + row_hi]) * f32(sa_hi * sb3));
+        acc_hi[4]  = f16(f32(tile_result[4u  * kTileM + row_hi]) * f32(sa_hi * sb4));
+        acc_hi[5]  = f16(f32(tile_result[5u  * kTileM + row_hi]) * f32(sa_hi * sb5));
+        acc_hi[6]  = f16(f32(tile_result[6u  * kTileM + row_hi]) * f32(sa_hi * sb6));
+        acc_hi[7]  = f16(f32(tile_result[7u  * kTileM + row_hi]) * f32(sa_hi * sb7));
+        acc_hi[8]  = f16(f32(tile_result[8u  * kTileM + row_hi]) * f32(sa_hi * sb8));
+        acc_hi[9]  = f16(f32(tile_result[9u  * kTileM + row_hi]) * f32(sa_hi * sb9));
+        acc_hi[10] = f16(f32(tile_result[10u * kTileM + row_hi]) * f32(sa_hi * sb10));
+        acc_hi[11] = f16(f32(tile_result[11u * kTileM + row_hi]) * f32(sa_hi * sb11));
+        acc_hi[12] = f16(f32(tile_result[12u * kTileM + row_hi]) * f32(sa_hi * sb12));
+        acc_hi[13] = f16(f32(tile_result[13u * kTileM + row_hi]) * f32(sa_hi * sb13));
+        acc_hi[14] = f16(f32(tile_result[14u * kTileM + row_hi]) * f32(sa_hi * sb14));
+        acc_hi[15] = f16(f32(tile_result[15u * kTileM + row_hi]) * f32(sa_hi * sb15));
+        acc_hi[16] = f16(f32(tile_result[16u * kTileM + row_hi]) * f32(sa_hi * sb16));
+        acc_hi[17] = f16(f32(tile_result[17u * kTileM + row_hi]) * f32(sa_hi * sb17));
+        acc_hi[18] = f16(f32(tile_result[18u * kTileM + row_hi]) * f32(sa_hi * sb18));
+        acc_hi[19] = f16(f32(tile_result[19u * kTileM + row_hi]) * f32(sa_hi * sb19));
+        acc_hi[20] = f16(f32(tile_result[20u * kTileM + row_hi]) * f32(sa_hi * sb20));
+        acc_hi[21] = f16(f32(tile_result[21u * kTileM + row_hi]) * f32(sa_hi * sb21));
+        acc_hi[22] = f16(f32(tile_result[22u * kTileM + row_hi]) * f32(sa_hi * sb22));
+        acc_hi[23] = f16(f32(tile_result[23u * kTileM + row_hi]) * f32(sa_hi * sb23));
+        acc_hi[24] = f16(f32(tile_result[24u * kTileM + row_hi]) * f32(sa_hi * sb24));
+        acc_hi[25] = f16(f32(tile_result[25u * kTileM + row_hi]) * f32(sa_hi * sb25));
+        acc_hi[26] = f16(f32(tile_result[26u * kTileM + row_hi]) * f32(sa_hi * sb26));
+        acc_hi[27] = f16(f32(tile_result[27u * kTileM + row_hi]) * f32(sa_hi * sb27));
+        acc_hi[28] = f16(f32(tile_result[28u * kTileM + row_hi]) * f32(sa_hi * sb28));
+        acc_hi[29] = f16(f32(tile_result[29u * kTileM + row_hi]) * f32(sa_hi * sb29));
+        acc_hi[30] = f16(f32(tile_result[30u * kTileM + row_hi]) * f32(sa_hi * sb30));
+        acc_hi[31] = f16(f32(tile_result[31u * kTileM + row_hi]) * f32(sa_hi * sb31));
+
+#if has_bias
+#if has_weight_idx_indirect
+        let bias_offset = weight_index_indirect[uniforms.weight_idx] * uniforms.N;
+#elif has_weight_idx
+        let bias_offset = uniforms.weight_idx * uniforms.N;
+#else
+        const bias_offset: u32 = 0;
+#endif
+#endif
+
+        // Write the two M rows this thread owns (lo and hi), all 32 N columns.
+        let global_m_lo = global_base_a + row_lo;
+        if (global_m_lo < uniforms.M) {
+            for (var n: u32 = 0; n < kTileN; n++) {
+                let global_n = global_base_b + n;
+                if (global_n < uniforms.N) {
+                    var val = output_element_t(acc_lo[n]);
+#if has_bias
+                    val += bias[bias_offset + global_n];
+#endif
+                    output.setByOffset(global_m_lo * uniforms.N + global_n, val);
+                }
+            }
+        }
+        let global_m_hi = global_base_a + row_hi;
+        if (global_m_hi < uniforms.M) {
+            for (var n: u32 = 0; n < kTileN; n++) {
+                let global_n = global_base_b + n;
+                if (global_n < uniforms.N) {
+                    var val = output_element_t(acc_hi[n]);
+#if has_bias
+                    val += bias[bias_offset + global_n];
+#endif
+                    output.setByOffset(global_m_hi * uniforms.N + global_n, val);
+                }
+            }
+        }
+    } // end M-tile loop
+}  // MAIN
