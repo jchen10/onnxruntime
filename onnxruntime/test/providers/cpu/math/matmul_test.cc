@@ -687,6 +687,7 @@ TEST(MathOpTest, MatMulBatchedSplitK) {
       .RunWithConfig();
 }
 
+#if defined(USE_WEBGPU)
 // f16 MatMul cases that exercise the Intel 8x16x16 subgroup-matrix impl.
 // The host picks the tile shape adaptively (TileM in {8,16,32,64}, TileN in
 // {16,32,64}); M and N may be any size and K must be a multiple of 16. When the
@@ -790,6 +791,7 @@ TEST(MathOpTest, MatMulSubgroupMatrix) {
     RunSubgroupMatrixMatMulTest(c.a_dims, c.K, c.N);
   }
 }
+#endif  // defined(USE_WEBGPU)
 
 #endif
 
