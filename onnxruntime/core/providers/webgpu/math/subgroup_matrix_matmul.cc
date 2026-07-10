@@ -44,31 +44,66 @@ class SubgroupMatrixMatMulImpl final : public MatMul::MatMulOptImpl {
 
     const auto* a = context.Input(0);
     const auto* b = context.Input(1);
-    // B must be a 2D KxN weight; A may be batched ([..., M, K]) and its leading
-    // dims are folded into M. Anything else falls back.
     const auto& a_shape = a->Shape();
     const auto& b_shape = b->Shape();
-    if (a_shape.NumDimensions() < 2 || b_shape.NumDimensions() != 2 ||
-        !a->IsDataType<MLFloat16>() || !b->IsDataType<MLFloat16>()) {
+    if (a_shape.NumDimensions() < 2 || !a->IsDataType<MLFloat16>() || !b->IsDataType<MLFloat16>()) {
       return Status::OK();
     }
 
     const uint32_t K = narrow<uint32_t>(a_shape[a_shape.NumDimensions() - 1]);
+    // The tiling selector is responsible for any subgroup-matrix alignment
+    // requirements (e.g. K % sg_mat_k == 0) and declines otherwise.
     if (K == 0) {
       return Status::OK();
     }
-    const uint32_t M = narrow<uint32_t>(a_shape.Size() / static_cast<int64_t>(K));
-    const uint32_t N = narrow<uint32_t>(b_shape[1]);
-    if (M == 0 || N == 0) {
-      return Status::OK();
+
+    // Two shapes are handled:
+    //  * Shared 2D weight B [K, N]: all leading A dims fold into M and the whole
+    //    problem runs as one z-slice (batch == 1). Optimal for weight matmuls -
+    //    B is read once and M-parallelism is maximal.
+    //  * Batched B [..., K, N] (true bmm): A is [..., M, K] with the same total
+    //    batch as B. Each (A, B) pair is one z-dispatched slice; the kernel
+    //    derives the per-slice A/B/output strides from M, N, K.
+    // Anything else (e.g. broadcasting A across B's batch) falls back.
+    uint32_t M = 0;
+    uint32_t N = 0;
+    uint32_t batch = 1;
+    if (b_shape.NumDimensions() == 2) {
+      if (narrow<uint32_t>(b_shape[0]) != K) {
+        return Status::OK();
+      }
+      N = narrow<uint32_t>(b_shape[1]);
+      M = narrow<uint32_t>(a_shape.Size() / static_cast<int64_t>(K));
+    } else {
+      // Batched B: A needs its own batch dim, B is [..., K, N], batch products
+      // must match (no broadcasting).
+      if (a_shape.NumDimensions() < 3 ||
+          narrow<uint32_t>(b_shape[b_shape.NumDimensions() - 2]) != K) {
+        return Status::OK();
+      }
+      M = narrow<uint32_t>(a_shape[a_shape.NumDimensions() - 2]);
+      N = narrow<uint32_t>(b_shape[b_shape.NumDimensions() - 1]);
+      if (M == 0 || N == 0) {
+        return Status::OK();
+      }
+      const int64_t a_batch = a_shape.Size() / (static_cast<int64_t>(M) * static_cast<int64_t>(K));
+      const int64_t b_batch = b_shape.Size() / (static_cast<int64_t>(K) * static_cast<int64_t>(N));
+      if (a_batch != b_batch) {
+        return Status::OK();
+      }
+      batch = narrow<uint32_t>(a_batch);
     }
-    // K must match B; the tiling selector is responsible for any subgroup-matrix
-    // alignment requirements (e.g. K % sg_mat_k == 0) and declines otherwise.
-    if (narrow<uint32_t>(b_shape[0]) != K) {
+
+    // The B right-operand is loaded with subgroupMatrixLoad using a row stride of
+    // N (uniforms.N). Intel's f16 subgroup-matrix load reads columns in 32-bit
+    // (2xf16) pairs and requires each K-row to start 4-byte aligned, i.e. an even
+    // element stride. An odd N offsets every other K-row by 2 bytes and corrupts
+    // the odd output columns. Fall back to the generic MatMul path for odd N.
+    if (N % 2 != 0) {
       return Status::OK();
     }
 
-    const std::optional<SubgroupMatrixTiling> tiling = tiling_selector_(context, M, N, K);
+    const std::optional<SubgroupMatrixTiling> tiling = tiling_selector_(context, M, N, K, batch);
     if (!tiling) {
       return Status::OK();
     }
@@ -95,7 +130,7 @@ class SubgroupMatrixMatMulImpl final : public MatMul::MatMulOptImpl {
 
     SubgroupMatrixMatMulProgram program{has_bias, config_index_, sg_mat_count_m, sg_mat_count_n, split_k};
     program.SetWorkgroupSize(kSubgroupMatrixSubgroupSize * split_k);
-    program.SetDispatchGroupSize(dispatch_x, dispatch_y, 1);
+    program.SetDispatchGroupSize(dispatch_x, dispatch_y, batch);
     program.CacheHint(has_bias, config_index_, sg_mat_count_m, sg_mat_count_n, split_k)
         .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, 1},
                     {b, ProgramTensorMetadataDependency::TypeAndRank, 1}})
@@ -133,7 +168,7 @@ Status GenerateShaderCode8x16x16(ShaderHelper& shader, const ShaderVariableHelpe
 // output tile with no split-K.
 SubgroupMatrixTilingSelector MakeDefaultTilingSelector() {
   return [](const ComputeContext&, uint32_t /*M*/, uint32_t /*N*/,
-            uint32_t /*K*/) -> std::optional<SubgroupMatrixTiling> {
+            uint32_t /*K*/, uint32_t /*batch*/) -> std::optional<SubgroupMatrixTiling> {
     return SubgroupMatrixTiling{32, 32, 1};
   };
 }
