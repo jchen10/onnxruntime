@@ -14,7 +14,7 @@
 #include "core/providers/webgpu/vendor/intel/math/matmul.h"
 #include "core/providers/webgpu/webgpu_utils.h"
 #if !defined(__wasm__)
-#include "core/providers/webgpu/vendor/intel/math/subgroup_matrix_matmul.h"
+#include "core/providers/webgpu/math/subgroup_matrix_matmul.h"
 #endif
 
 namespace onnxruntime {
@@ -124,7 +124,7 @@ Status MatMul::ComputeInternal(ComputeContext& context) const {
   bool has_bias = context.InputCount() > 2;
 
 #if !defined(__wasm__)
-  // Try a vendor-optimized implementation (e.g. Intel subgroup-matrix) first.
+  // Try the subgroup-matrix implementation (with a vendor-specific tiling policy) first.
   if (impl_) {
     bool handled = false;
     ORT_RETURN_IF_ERROR(impl_->Compute(context, handled));
@@ -195,9 +195,9 @@ Status MatMul::PrePackInternal(ComputeContextBase& context,
                                /*out*/ bool& is_packed) {
   is_packed = false;
 #if !defined(__wasm__)
-  // Create the vendor-optimized implementation once based on device capabilities.
+  // Create the subgroup-matrix implementation once based on device capabilities.
   if (!impl_) {
-    impl_ = intel::CreateSubgroupMatrixMatMulImpl(context, *this);
+    impl_ = CreateSubgroupMatrixMatMulImpl(*this, context);
   }
 #else
   ORT_UNUSED_PARAMETER(context);

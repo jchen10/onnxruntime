@@ -5,8 +5,6 @@
 
 #include "core/providers/webgpu/vendor/intel/intel_device_info.h"
 
-#include <algorithm>
-
 namespace onnxruntime {
 namespace webgpu {
 namespace intel {
@@ -19,23 +17,6 @@ uint32_t HwSubgroups(std::string_view arch) {
     return 256;  // 8 Xe cores x 32
   }
   return 0;  // unknown architecture; caller decides the fallback
-}
-
-bool IsSubgroupMatrixConfigSupported(const ComputeContextBase& context, uint32_t m, uint32_t n, uint32_t k) {
-  if (!context.HasFeature(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix)) {
-    return false;
-  }
-  const wgpu::AdapterInfo& adapter_info = context.AdapterInfo();
-  if (adapter_info.subgroupMinSize != 16 || adapter_info.subgroupMaxSize != 32) {
-    return false;
-  }
-  const wgpu::AdapterPropertiesSubgroupMatrixConfigs& configs = context.SubgroupMatrixConfigs();
-  return std::any_of(configs.configs, configs.configs + configs.configCount,
-                     [m, n, k](const auto& c) {
-                       return c.componentType == wgpu::SubgroupMatrixComponentType::F16 &&
-                              c.resultComponentType == wgpu::SubgroupMatrixComponentType::F16 &&
-                              c.M == m && c.N == n && c.K == k;
-                     });
 }
 
 }  // namespace intel

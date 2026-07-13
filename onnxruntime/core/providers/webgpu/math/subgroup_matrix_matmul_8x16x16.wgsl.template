@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-// Intel SubgroupMatrix MatMul kernel (8x16x16 config, F16).
+// Subgroup-matrix MatMul kernel (F16) for the 8x16x16 (sg_mat_m x sg_mat_n x
+// sg_mat_k) subgroup-matrix shape. The sg_mat_m/n/k values are still supplied as
+// params, but this kernel is currently only validated for 8/16/16; other
+// subgroup-matrix shapes are TBD and should get their own template variant.
 //
 // Computes Y[MxN] = A[MxK] @ B[KxN] using subgroupMatrixMultiplyAccumulate.
 //
@@ -11,13 +14,11 @@
 //    right operand (subgroup_matrix_right<f16, sg_mat_n, sg_mat_k>) with stride N.
 //
 // Workgroup: split_k subgroups x 32 lanes (split_k in {1,2,4,8}).
-// Tile: kTileM x kTileN, chosen adaptively by the host. Each subgroup computes
-// the whole tile as kSgMatCountM x kSgMatCountN subgroup matrices.
-// kSgMatCountM is in {1,2,4,8} (TileM in {8,16,32,64}) and kSgMatCountN is in
-// {1,2,4} (TileN in {16,32,64}). K iterated in
-// sg_mat_k blocks. When split_k > 1 the K blocks are distributed round-robin
-// across the subgroups, each accumulates its own partial tile in shared memory,
-// and the partials are summed at write-out.
+// Tile: kTileM x kTileN, chosen adaptively by the host config provider. Each
+// subgroup computes the whole tile as kSgMatCountM x kSgMatCountN subgroup
+// matrices. K is iterated in sg_mat_k blocks. When split_k > 1 the K blocks are
+// distributed round-robin across the subgroups, each accumulates its own partial
+// tile in shared memory, and the partials are summed at write-out.
 //
 // Preconditions enforced by the host: K % sg_mat_k == 0. M and N may be any
 // size; partial tiles are handled by bounds-checked stores. Out-of-range A/B
@@ -50,9 +51,13 @@ const kSubgroupSize: u32 = 32;                   // Lanes per subgroup
 var<workgroup> scratch: array<f16, kTileM * kTileN * kSplitK>;
 
 $MAIN {
-    let n_tile = workgroup_id.x;             // which kTileN-wide column tile
+    // Recover the logical (n_tile, m_tile) from the flattened workgroup index.
+    // The host dispatch may be normalized (reshaped across x/y/z to stay within
+    // per-dimension limits), so workgroup_id.x/y cannot be used directly; the
+    // row-major grid is num_n_tile columns wide.
+    let n_tile = workgroup_idx % uniforms.num_n_tile;   // which kTileN-wide column tile
     let global_base_n = n_tile * kTileN;
-    let m_tile = workgroup_id.y;             // which kTileM-tall row tile
+    let m_tile = workgroup_idx / uniforms.num_n_tile;   // which kTileM-tall row tile
     let m_base = m_tile * kTileM;
     let k_blocks = uniforms.K / kSgMatK;
     let sg_index = local_idx / kSubgroupSize;          // which split-K subgroup (0..kSplitK-1)

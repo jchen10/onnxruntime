@@ -20,10 +20,6 @@ namespace intel {
 // caller can apply its own fallback policy.
 uint32_t HwSubgroups(std::string_view arch);
 
-// Returns true if the device exposes an m x n x k F16/F16 subgroup matrix config
-// within the Intel Xe subgroup size range (min 16, max 32).
-bool IsSubgroupMatrixConfigSupported(const ComputeContextBase& context, uint32_t m, uint32_t n, uint32_t k);
-
 }  // namespace intel
 }  // namespace webgpu
 }  // namespace onnxruntime
