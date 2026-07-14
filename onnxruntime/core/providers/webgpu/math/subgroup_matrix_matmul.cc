@@ -54,8 +54,14 @@ class SubgroupMatrixMatMulImpl final : public MatMul::MatMulOptImpl {
     }
 
     const uint32_t K = narrow<uint32_t>(a_shape[a_shape.NumDimensions() - 1]);
+    if (K == 0) {
+      return Status::OK();
+    }
     const uint32_t M = narrow<uint32_t>(a_shape.Size() / static_cast<int64_t>(K));
     const uint32_t N = narrow<uint32_t>(b_shape[1]);
+    if (M == 0 || N == 0) {
+      return Status::OK();
+    }
     // K must match B; the tiling selector is responsible for any subgroup-matrix
     // alignment requirements (e.g. K % sg_mat_k == 0) and declines otherwise.
     if (narrow<uint32_t>(b_shape[0]) != K) {
