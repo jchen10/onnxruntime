@@ -87,6 +87,9 @@ class SubgroupMatrixMatMulImpl final : public MatMul::MatMulOptImpl {
     const uint32_t split_k = tiling->split_k;
     const uint32_t sg_mat_count_m = tile_m / config.M;
     const uint32_t sg_mat_count_n = tile_n / config.N;
+    ORT_ENFORCE(tile_m % config.M == 0 && tile_n % config.N == 0,
+                "Tiling must be a multiple of the subgroup-matrix shape: ",
+                tile_m, "x", tile_n, " vs ", config.M, "x", config.N);
     const uint32_t dispatch_x = (N + tile_n - 1) / tile_n;
     const uint32_t dispatch_y = (M + tile_m - 1) / tile_m;
 
