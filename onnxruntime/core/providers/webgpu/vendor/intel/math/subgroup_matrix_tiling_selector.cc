@@ -5,17 +5,22 @@
 
 #include "core/providers/webgpu/vendor/intel/math/subgroup_matrix_tiling_selector.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "core/common/narrow.h"
 #include "core/providers/webgpu/compute_context.h"
 #include "core/providers/webgpu/math/subgroup_matrix_matmul.h"
 #include "core/providers/webgpu/vendor/intel/intel_device_info.h"
+#include "core/providers/webgpu/vendor/intel/math/subgroup_matrix_matmul_tuning.h"
 
 // Pretuned tile + split-K table baked into the build; consulted before the
 // heuristic in SelectTiling.
@@ -50,6 +55,38 @@ bool IsTilingValid(const SubgroupMatrixTiling& t, uint32_t K) {
     return false;
   }
   return t.tile_m * t.tile_n * t.split_k <= kMaxScratchElems;
+}
+
+// --- Offline-autotuner state (see subgroup_matrix_matmul_tuning.h) -----------
+//
+// Only the autotuner writes these. On the dispatch path the cost is two relaxed
+// atomic loads; the mutex is taken only once (to record the arch) and whenever a
+// tiling override is actually installed.
+std::mutex g_tuning_mutex;
+std::atomic<bool> g_sgmm_disabled{false};
+std::atomic<bool> g_tiling_override_active{false};
+SubgroupMatrixTiling g_tiling_override{};      // guarded by g_tuning_mutex
+std::atomic<bool> g_device_arch_captured{false};
+std::string g_device_arch;  // guarded by g_tuning_mutex
+
+void CaptureDeviceArch(std::string_view arch) {
+  if (g_device_arch_captured.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_tuning_mutex);
+  g_device_arch.assign(arch);
+  g_device_arch_captured.store(true, std::memory_order_release);
+}
+
+std::optional<SubgroupMatrixTiling> GetTilingOverride() {
+  if (!g_tiling_override_active.load(std::memory_order_acquire)) {
+    return std::nullopt;
+  }
+  std::lock_guard<std::mutex> lock(g_tuning_mutex);
+  if (!g_tiling_override_active.load(std::memory_order_relaxed)) {
+    return std::nullopt;  // cleared between the unlocked check and the lock
+  }
+  return g_tiling_override;
 }
 
 // HwSubgroups returns 0 for an unrecognized arch; fall back to a conservative
@@ -204,14 +241,64 @@ SubgroupMatrixTilingSelector CreateSubgroupMatrixTilingSelector(
   // The subgroup-matrix shape itself is fixed by the kernel and not selected here.
   return [](const ComputeContext& context, uint32_t M, uint32_t N,
             uint32_t K, uint32_t batch) -> std::optional<SubgroupMatrixTiling> {
+    const std::string_view arch = std::string_view{context.AdapterInfo().architecture};
+    // Recorded before the autotuner's disable check so the generic-path baseline
+    // run still identifies the device.
+    CaptureDeviceArch(arch);
+    if (g_sgmm_disabled.load(std::memory_order_relaxed)) {
+      return std::nullopt;
+    }
     // Only K needs to align to the subgroup tiling; M and N partial tiles are
     // handled by bounds-checked stores in the kernel.
     if (K % kSubgroupMatrixK != 0) {
       return std::nullopt;
     }
-    const std::string_view arch = std::string_view{context.AdapterInfo().architecture};
+    if (const auto forced = GetTilingOverride(); forced && IsTilingValid(*forced, K)) {
+      return forced;
+    }
     return SelectTiling(arch, M, N, K, batch);
   };
+}
+
+void SetSgMatMulTilingOverride(std::optional<SubgroupMatrixTiling> tiling) {
+  std::lock_guard<std::mutex> lock(g_tuning_mutex);
+  if (tiling) {
+    g_tiling_override = *tiling;
+  }
+  g_tiling_override_active.store(tiling.has_value(), std::memory_order_release);
+}
+
+void SetSgMatMulDisabled(bool disabled) {
+  g_sgmm_disabled.store(disabled, std::memory_order_relaxed);
+}
+
+std::string GetSgMatMulDeviceArch() {
+  std::lock_guard<std::mutex> lock(g_tuning_mutex);
+  return g_device_arch;
+}
+
+std::vector<SubgroupMatrixTiling> EnumerateSubgroupMatrixTilings(uint32_t M, uint32_t N, uint32_t K) {
+  std::vector<SubgroupMatrixTiling> tilings;
+  if (M == 0 || N == 0 || K % kSubgroupMatrixK != 0) {
+    return tilings;
+  }
+  for (uint32_t tm : kTileMCandidates) {
+    if (tm > M && tm != kTileMCandidates[0]) {
+      continue;
+    }
+    for (uint32_t tn : kTileNCandidates) {
+      if (tn > N && tn != kTileNCandidates[0]) {
+        continue;
+      }
+      for (uint32_t sk : kSplitKCandidates) {
+        const SubgroupMatrixTiling tiling{tm, tn, sk};
+        if (IsTilingValid(tiling, K)) {
+          tilings.push_back(tiling);
+        }
+      }
+    }
+  }
+  return tilings;
 }
 
 }  // namespace intel
